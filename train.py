@@ -8,7 +8,7 @@ import yaml
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BertModel, BertConfig
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -32,98 +32,118 @@ def get_device(device_config):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_config)
 
-# 自定义数据集类
-class DNASequenceDataset(Dataset):
-    def __init__(self, sequences, features, labels, tokenizer, max_length):
-        self.sequences = sequences
-        self.features = features
-        self.labels = labels
+# 特征提取类 - 用于预先提取BERT特征
+class BertFeatureExtractor:
+    def __init__(self, model_path, tokenizer, max_length, device):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.device = device
+        
+        # 加载预训练的BERT模型 - 使用BertModel而不是AutoModel避免配置冲突
+        # 尝试直接加载BertModel
+        self.model = BertModel.from_pretrained(
+            model_path, 
+            trust_remote_code=True,
+            local_files_only=True
+        ).to(device)
+        print("Successfully loaded BERT model")
+        
+        # 设置模型为评估模式，禁用dropout等
+        self.model.eval()
+    
+    def extract_features(self, sequences, batch_size=32):
+        """从序列中提取BERT特征"""
+        features = []
+        
+        # 确保所有序列都是字符串类型
+        sequences = [str(seq) for seq in sequences]
+        
+        # 检查数据类型
+        print(f"Sequences type: {type(sequences)}")
+        print(f"First sequence type: {type(sequences[0])}")
+        # print(f"First few sequences: {sequences[:3]}")
+        
+        # 分批处理序列以避免OOM
+        for i in tqdm(range(0, len(sequences), batch_size), desc="提取BERT特征"):
+            batch_sequences = sequences[i:i+batch_size]
+            
+            try:
+                # 对批次进行编码
+                encoding = self.tokenizer(
+                    batch_sequences,
+                    padding='max_length',
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors='pt'
+                ).to(self.device)
+                
+                # 不计算梯度
+                with torch.no_grad():
+                    outputs = self.model(**encoding)
+                    # 获取[CLS]标记的嵌入，代表整个序列的表示
+                    batch_features = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+                    features.append(batch_features)
+            except Exception as e:
+                print(f"Error processing batch {i}-{i+batch_size}: {e}")
+                print(f"Problematic batch: {batch_sequences}")
+                raise
+        
+        # 合并所有批次的特征
+        return np.vstack(features)
+
+# 优化的数据集类，使用预先提取的特征
+class OptimizedDNADataset(Dataset):
+    def __init__(self, bert_features, additional_features, labels):
+        """
+        初始化数据集
+        bert_features: 从BERT提取的特征 [n_samples, bert_dim]
+        additional_features: 额外特征 [n_samples, feature_dim]
+        labels: 标签 [n_samples]
+        """
+        self.bert_features = torch.tensor(bert_features, dtype=torch.float32)
+        self.additional_features = torch.tensor(additional_features, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.float32)
     
     def __len__(self):
-        return len(self.sequences)
+        return len(self.labels)
     
     def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        features = self.features[idx]
-        label = self.labels[idx]
-        
-        # 使用DNABERT2的tokenizer处理序列
-        encoding = self.tokenizer(
-            seq,
-            return_tensors='pt',
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_length
-        )
-        
-        # 去掉batch维度
-        encoding = {k: v.squeeze(0) for k, v in encoding.items()}
-        
         return {
-            'input_ids': encoding['input_ids'],
-            'attention_mask': encoding['attention_mask'],
-            'features': torch.tensor(features, dtype=torch.float32),
-            'label': torch.tensor(label, dtype=torch.float32)
+            'bert_features': self.bert_features[idx],
+            'additional_features': self.additional_features[idx],
+            'label': self.labels[idx]
         }
 
-# 定义融合模型
-class DNASequenceClassifier(nn.Module):
-    def __init__(self, bert_model, config):
-        super(DNASequenceClassifier, self).__init__()
-        self.bert_model = bert_model
-        
-        # BERT输出维度通常是768
-        bert_output_dim = 768
+# 简化的分类器模型 - 只训练分类层
+class DNAClassifier(nn.Module):
+    def __init__(self, config):
+        super(DNAClassifier, self).__init__()
+        bert_dim = 768  # BERT输出维度通常是768
         feature_dim = config['model']['feature_dim']
         hidden_dim = config['model']['hidden_dim']
         dropout_rate = config['model']['dropout_rate']
-        feature_encoder_dims = config['model']['feature_encoder']['hidden_dims']
         
-        # 对额外特征的MLP编码层
-        feature_encoder_layers = []
-        input_dim = feature_dim
-        for hidden_dim in feature_encoder_dims:
-            feature_encoder_layers.extend([
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate)
-            ])
-            input_dim = hidden_dim
+        # 特征编码器 - 处理额外特征
+        self.feature_encoder = nn.Sequential(
+            nn.Linear(feature_dim, 32),
+            nn.ReLU()
+        )
         
-        # 移除最后一层的Dropout
-        if feature_encoder_layers:
-            feature_encoder_layers = feature_encoder_layers[:-1]
-            
-        self.feature_encoder = nn.Sequential(*feature_encoder_layers)
-        
-        # 获取特征编码器的输出维度
-        feature_output_dim = feature_encoder_dims[-1] if feature_encoder_dims else feature_dim
-        
-        # 融合后特征的分类器
+        # 分类器 - 结合BERT特征和额外特征
         self.classifier = nn.Sequential(
-            nn.Linear(bert_output_dim + feature_output_dim, hidden_dim),
+            nn.Linear(bert_dim + 32, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
     
-    def forward(self, input_ids, attention_mask, features):
-        # 获取BERT的输出
-        bert_output = self.bert_model(input_ids=input_ids, attention_mask=attention_mask)
-        # 获取[CLS]标记的嵌入，代表整个序列的表示
-        sequence_output = bert_output.last_hidden_state[:, 0, :]
-        
+    def forward(self, bert_features, additional_features):
         # 对额外特征进行编码
-        feature_encoded = self.feature_encoder(features)
+        encoded_features = self.feature_encoder(additional_features)
         
-        # 特征融合
-        fused_features = torch.cat((sequence_output, feature_encoded), dim=1)
+        # 融合BERT特征和额外特征
+        fused_features = torch.cat((bert_features, encoded_features), dim=1)
         
         # 分类预测
         output = self.classifier(fused_features)
@@ -132,15 +152,19 @@ class DNASequenceClassifier(nn.Module):
 
 # 数据加载
 def load_data(file_path):
-    
     df = pd.read_csv(file_path)
     sequences = df['sequence'].values
     features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
     labels = df['label'].values
     
+    # 检查数据
+    print(f"Data shapes - Sequences: {sequences.shape}, Features: {features.shape}, Labels: {labels.shape}")
+    print(f"Sequence data type: {type(sequences)}, Element type: {type(sequences[0]) if len(sequences) > 0 else 'N/A'}")
+    print(f"Sample sequences: {sequences[:3]}")
+    
     return sequences, features, labels
 
-# 模型训练函数
+# 训练模型
 def train_model(model, train_loader, val_loader, criterion, optimizer, config, device):
     patience = config['training']['patience']
     num_epochs = config['training']['num_epochs']
@@ -153,14 +177,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, d
         model.train()
         total_loss = 0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            features = batch['features'].to(device)
+        # 训练阶段
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Training]"):
+            bert_features = batch['bert_features'].to(device)
+            additional_features = batch['additional_features'].to(device)
             labels = batch['label'].to(device)
             
             # 前向传播
-            outputs = model(input_ids, attention_mask, features)
+            outputs = model(bert_features, additional_features)
             
             # 计算损失
             loss = criterion(outputs, labels)
@@ -211,13 +235,12 @@ def evaluate_model(model, data_loader, criterion, device):
     
     with torch.no_grad():
         for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            features = batch['features'].to(device)
+            bert_features = batch['bert_features'].to(device)
+            additional_features = batch['additional_features'].to(device)
             labels = batch['label'].to(device)
             
             # 前向传播
-            outputs = model(input_ids, attention_mask, features)
+            outputs = model(bert_features, additional_features)
             
             # 计算损失
             loss = criterion(outputs, labels)
@@ -277,34 +300,29 @@ def main():
     model_path = config['model']['bert_model_path']
     
     # 从配置文件获取模型加载参数
-    trust_remote_code = config.get('loading', {}).get('trust_remote_code', True)
-    local_files_only = config.get('loading', {}).get('local_files_only', True)
+    trust_remote_code = config['loading']['trust_remote_code']
+    local_files_only = config['loading']['local_files_only']
     
-    # 尝试使用标准方式加载
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        trust_remote_code=trust_remote_code,
-        local_files_only=local_files_only
-    )
-    
-    from transformers import BertModel
-    bert_model = BertModel.from_pretrained(
-        model_path,
-        trust_remote_code=trust_remote_code,
-        local_files_only=local_files_only
-    )
-
-    # 确保模型处于评估模式开始
-    bert_model.eval()
+    print("Loading tokenizer...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only
+        )
+        print("Tokenizer loaded successfully")
+    except Exception as e:
+        print(f"Error loading tokenizer: {e}")
+        return
     
     # 加载数据
     print("Loading data...")
     data_file = config['data']['file_path']
-    sequences, features, labels = load_data(data_file)
+    sequences, additional_features, labels = load_data(data_file)
     
     # 划分训练集和验证集
     train_seqs, val_seqs, train_features, val_features, train_labels, val_labels = train_test_split(
-        sequences, features, labels, 
+        sequences, additional_features, labels, 
         test_size=config['data']['test_size'], 
         random_state=config['data']['random_seed'],
         stratify=labels
@@ -312,32 +330,51 @@ def main():
     
     print(f"Train set size: {len(train_seqs)}, Validation set size: {len(val_seqs)}")
     
-    # 创建数据集
+    # 提取BERT特征
+    print("Extracting BERT features...")
     max_seq_length = config['training']['max_seq_length']
-    train_dataset = DNASequenceDataset(train_seqs, train_features, train_labels, tokenizer, max_seq_length)
-    val_dataset = DNASequenceDataset(val_seqs, val_features, val_labels, tokenizer, max_seq_length)
+    feature_extractor = BertFeatureExtractor(model_path, tokenizer, max_seq_length, device)
+    
+    # 提取训练集和验证集的BERT特征
+    print("Extracting BERT features for training set...")
+    train_bert_features = feature_extractor.extract_features(train_seqs)
+    
+    print("Extracting BERT features for validation set...")
+    val_bert_features = feature_extractor.extract_features(val_seqs)
+    
+    print(f"BERT feature dimension: {train_bert_features.shape[1]}")
+    
+    # 创建优化的数据集
+    train_dataset = OptimizedDNADataset(train_bert_features, train_features, train_labels)
+    val_dataset = OptimizedDNADataset(val_bert_features, val_features, val_labels)
     
     # 创建数据加载器
     batch_size = config['training']['batch_size']
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     
-    # 创建模型
-    model = DNASequenceClassifier(bert_model, config).to(device)
+    # 创建分类器模型 (不包含BERT部分)
+    model = DNAClassifier(config).to(device)
+    
+    # 打印模型信息
+    print("Classification model architecture:")
+    print(model)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total trainable parameters: {total_params:,}")
     
     # 定义损失函数和优化器
     criterion = nn.BCELoss()
     optimizer = optim.Adam(model.parameters(), lr=float(config['training']['learning_rate']))
     
     # 训练模型
-    print("Training model...")
+    print("Training classification model...")
     history = train_model(model, train_loader, val_loader, criterion, optimizer, config, device)
     
     # 可视化训练过程
     plot_training_history(history)
     
     # 加载最佳模型进行评估
-    best_model = DNASequenceClassifier(bert_model, config).to(device)
+    best_model = DNAClassifier(config).to(device)
     best_model.load_state_dict(torch.load('best_dna_classifier.pth'))
     
     val_loss, val_accuracy, val_auc = evaluate_model(best_model, val_loader, criterion, device)

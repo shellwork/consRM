@@ -1,30 +1,28 @@
 # 数据参数
 data:
   file_path: "data/combine.csv"  # 数据文件路径
-  test_size: 0.2                  # 验证集比例
-  random_seed: 42                 # 随机种子
+  test_size: 0.2                 # 验证集比例
+  random_seed: 42                # 随机种子
 
 # 模型参数
 model:
-  bert_model_path: "embed_model"  # DNABERT2模型路径
-  feature_dim: 4                  # 额外特征的维度
-  hidden_dim: 256                 # 分类器隐藏层维度
-  dropout_rate: 0.3               # Dropout比例
-  feature_encoder:
-    hidden_dims: [64, 32]         # 特征编码器隐藏层维度
+  bert_model_path: "embed_model" # DNABERT2模型路径
+  feature_dim: 4                 # 额外特征的维度
+  hidden_dim: 256                # 分类器隐藏层维度
+  dropout_rate: 0.3              # Dropout比例
 
 # 训练参数
 training:
-  batch_size: 58                  # 批大小
-  learning_rate: 2e-5             # 学习率
-  num_epochs: 20                  # 最大训练轮数
-  patience: 3                     # 早停耐心值
-  max_seq_length: 512             # 序列最大长度
+  batch_size: 128                # 批大小 
+  learning_rate: 1e-3            # 学习率
+  num_epochs: 50                 # 最大训练轮数
+  patience: 5                    # 早停耐心值
+  max_seq_length: 512            # 序列最大长度
 
 # 设备配置
-device: "auto"                    # 可选: "auto", "cuda", "cpu"
+device: "auto"                   # 可选: "auto", "cuda", "cpu"
 
 # 模型加载参数
 loading:
-  trust_remote_code: true         # 是否信任远程代码
-  local_files_only: true          # 是否只使用本地文件
+  trust_remote_code: True        # 是否信任远程代码
+  local_files_only: True         # 是否只使用本地文件

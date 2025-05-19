@@ -32,42 +32,149 @@ def get_device(device_config):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_config)
 
+# original version
+# class BertFeatureExtractor:
+#     def __init__(self, model_path, tokenizer, max_length, device):
+#         self.tokenizer = tokenizer
+#         self.max_length = max_length
+#         self.device = device
+#         config = load_config()
+#         # 加载预训练的BERT模型 - 使用BertModel而不是AutoModel避免配置冲突
+#         trust_remote_code = config['loading']['trust_remote_code']
+#         local_files_only = config['loading']['local_files_only']
+#         self.model = BertModel.from_pretrained(
+#             model_path,
+#             trust_remote_code=trust_remote_code,
+#             local_files_only=local_files_only
+#         ).to(device)
+#         print("Successfully loaded BERT model")
+        
+#         # 设置模型为评估模式，禁用dropout等
+#         self.model.eval()
+    
+#     def extract_features(self, sequences, batch_size=32):
+#         """从序列中提取BERT特征"""
+#         features = []
+        
+#         # 确保所有序列都是字符串类型
+#         sequences = [str(seq) for seq in sequences]
+        
+#         # 检查数据类型
+#         print(f"Sequences type: {type(sequences)}")
+#         print(f"First sequence type: {type(sequences[0])}")
+#         # print(f"First few sequences: {sequences[:3]}")
+        
+#         # 分批处理序列以避免OOM
+#         for i in tqdm(range(0, len(sequences), batch_size), desc="提取BERT特征"):
+#             batch_sequences = sequences[i:i+batch_size]
+            
+#             try:
+#                 # 对批次进行编码
+#                 encoding = self.tokenizer(
+#                     batch_sequences,
+#                     padding='max_length',
+#                     truncation=True,
+#                     max_length=self.max_length,
+#                     return_tensors='pt'
+#                 ).to(self.device)
+                
+#                 # 不计算梯度
+#                 with torch.no_grad():
+#                     outputs = self.model(**encoding)
+#                     # 获取[CLS]标记的嵌入，代表整个序列的表示
+#                     batch_features = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+#                     features.append(batch_features)
+#             except Exception as e:
+#                 print(f"Error processing batch {i}-{i+batch_size}: {e}")
+#                 print(f"Problematic batch: {batch_sequences}")
+#                 raise
+        
+#         # 合并所有批次的特征
+#         return np.vstack(features)
+
 # 特征提取类 - 用于预先提取BERT特征
 class BertFeatureExtractor:
     def __init__(self, model_path, tokenizer, max_length, device):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.device = device
+        
         config = load_config()
-        # 加载预训练的BERT模型 - 使用BertModel而不是AutoModel避免配置冲突
+        
+        # 从配置文件加载推理优化相关参数
+        inference_config = config.get('inference', {})
+        self.batch_size = inference_config.get('batch_size', 128)  # 默认使用更大的批次大小
+        self.num_workers = inference_config.get('num_workers', 4)  # 数据加载的并行工作进程数
+        self.use_amp = inference_config.get('use_amp', True)  # 是否使用混合精度推理
+        self.use_gradient_checkpointing = inference_config.get('use_gradient_checkpointing', False)  # 是否使用梯度检查点
+        
+        # 加载预训练的BERT模型
         trust_remote_code = config['loading']['trust_remote_code']
         local_files_only = config['loading']['local_files_only']
+        
+        # 加载模型时配置优化参数
         self.model = BertModel.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
             local_files_only=local_files_only
         ).to(device)
-        print("Successfully loaded BERT model")
+        
+        # 如果需要梯度检查点（在推理时通常不需要，但在某些情况下可用于控制内存使用）
+        if self.use_gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+        
+        print(f"Successfully loaded BERT model with batch_size={self.batch_size}, num_workers={self.num_workers}, use_amp={self.use_amp}")
         
         # 设置模型为评估模式，禁用dropout等
         self.model.eval()
-    
-    def extract_features(self, sequences, batch_size=32):
-        """从序列中提取BERT特征"""
-        features = []
         
+        # 创建AMP的scaler，用于混合精度计算
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+    
+    def _create_dataloader(self, sequences):
+        """创建用于批处理的DataLoader"""
         # 确保所有序列都是字符串类型
         sequences = [str(seq) for seq in sequences]
         
+        # 创建简单的Dataset
+        class SimpleDataset(torch.utils.data.Dataset):
+            def __init__(self, texts):
+                self.texts = texts
+                
+            def __len__(self):
+                return len(self.texts)
+                
+            def __getitem__(self, idx):
+                return self.texts[idx]
+        
+        dataset = SimpleDataset(sequences)
+        
+        # 创建DataLoader进行并行加载和批处理
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,  # 使用固定内存加速CPU到GPU的数据传输
+            shuffle=False  # 保持顺序不变
+        )
+    
+    def extract_features(self, sequences, batch_size=None):
+        """从序列中提取BERT特征"""
+        if batch_size is not None:
+            self.batch_size = batch_size  # 允许在运行时覆盖配置的批次大小
+            
+        features = []
+        
+        # 创建DataLoader以实现并行数据处理
+        dataloader = self._create_dataloader(sequences)
+        
         # 检查数据类型
         print(f"Sequences type: {type(sequences)}")
-        print(f"First sequence type: {type(sequences[0])}")
-        # print(f"First few sequences: {sequences[:3]}")
+        if len(sequences) > 0:  # 改用 len() 检查是否为空，而不是直接使用 if sequences
+            print(f"First sequence type: {type(sequences[0])}")
         
-        # 分批处理序列以避免OOM
-        for i in tqdm(range(0, len(sequences), batch_size), desc="提取BERT特征"):
-            batch_sequences = sequences[i:i+batch_size]
-            
+        # 处理每个批次
+        for batch_sequences in tqdm(dataloader, desc="提取BERT特征"):
             try:
                 # 对批次进行编码
                 encoding = self.tokenizer(
@@ -80,13 +187,17 @@ class BertFeatureExtractor:
                 
                 # 不计算梯度
                 with torch.no_grad():
-                    outputs = self.model(**encoding)
+                    # 使用自动混合精度(AMP)进行推理
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        outputs = self.model(**encoding)
+                    
                     # 获取[CLS]标记的嵌入，代表整个序列的表示
                     batch_features = outputs.last_hidden_state[:, 0, :].cpu().numpy()
                     features.append(batch_features)
+                    
             except Exception as e:
-                print(f"Error processing batch {i}-{i+batch_size}: {e}")
-                print(f"Problematic batch: {batch_sequences}")
+                print(f"Error processing batch: {e}")
+                print(f"Problematic batch samples: {batch_sequences[:2]}")  # 只打印前两个样本以减少输出
                 raise
         
         # 合并所有批次的特征

@@ -4,10 +4,29 @@ data:
   test_size: 0.2                 # 验证集比例
   random_seed: 42                # 随机种子
 
+# 推理参数
+inference:
+  # 批处理大小 - A10 GPU上可以设置更大的批次大小以提高GPU利用率
+  batch_size: 512
+  
+  # 数据加载的并行工作进程数
+  num_workers: 16
+  
+  # 是否使用自动混合精度 (Automatic Mixed Precision): 有问题别开
+  use_amp: false
+  
+  # 是否使用梯度检查点 (通常在推理阶段不需要，但可以作为控制内存使用的选项)
+  use_gradient_checkpointing: false
+  
+
+loading:
+  trust_remote_code: true
+  local_files_only: true
+
 # 模型参数
 model:
   bert_model_path: "embed_model" # DNABERT2模型路径
-  feature_dim: 4                 # 额外特征的维度
+  feature_dim: 2                 # 额外特征的维度
   hidden_dim: 256                # 分类器隐藏层维度
   dropout_rate: 0.3              # Dropout比例
 
@@ -26,3 +45,4 @@ device: "auto"                   # 可选: "auto", "cuda", "cpu"
 loading:
   trust_remote_code: True        # 是否信任远程代码
   local_files_only: True         # 是否只使用本地文件
+  

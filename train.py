@@ -156,7 +156,7 @@ def load_data(file_path):
     df = pd.read_csv(file_path)
     sequences = df['sequence'].values
     # features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
-    features = df[['noes_score', 'seq_score', 'phastCons']].values
+    features = df[['seq_score', 'phastCons']].values
     labels = df['label'].values
     
     # 检查数据

@@ -50,7 +50,7 @@ def main():
     df = pd.read_csv(test_file)
     sequences = df['sequence'].values
     # features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
-    features = df[['noes_score', 'seq_score', 'phastCons']].values
+    features = df[['seq_score', 'phastCons']].values
     
     # 加载标签（如果有）
     if 'label' in df.columns:

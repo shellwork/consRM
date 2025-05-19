@@ -38,13 +38,14 @@ class BertFeatureExtractor:
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.device = device
-        
+        config = load_config()
         # 加载预训练的BERT模型 - 使用BertModel而不是AutoModel避免配置冲突
-        # 尝试直接加载BertModel
+        trust_remote_code = config['loading']['trust_remote_code']
+        local_files_only = config['loading']['local_files_only']
         self.model = BertModel.from_pretrained(
-            model_path, 
-            trust_remote_code=True,
-            local_files_only=True
+            model_path,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only
         ).to(device)
         print("Successfully loaded BERT model")
         
@@ -154,7 +155,8 @@ class DNAClassifier(nn.Module):
 def load_data(file_path):
     df = pd.read_csv(file_path)
     sequences = df['sequence'].values
-    features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
+    # features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
+    features = df[['noes_score', 'seq_score', 'phastCons']].values
     labels = df['label'].values
     
     # 检查数据

@@ -9,14 +9,14 @@ FILE1_PATH = "data/negative_all.csv"  # 替换为第一个CSV文件的路径
 FILE2_PATH = "data/positive_all.csv" # 替换为第二个CSV文件的路径
 
 # 输出文件
-OUTPUT_FILE_PATH = "data/combine.csv" # 替换为希望保存的输出文件路径
+OUTPUT_FILE_PATH = "data/c.csv" # 替换为希望保存的输出文件路径
 
 # 从每个文件抽取的行数
 # 设置为 -1 表示抽取该文件的所有行
 # 设置为 0 表示不抽取该文件的任何行
 # 设置为正数 N 表示随机抽取 N 行
 NUM_SAMPLES_FILE1 = 1000   # 从第一个文件抽取的行数 (例如：抽取所有行)
-NUM_SAMPLES_FILE2 = 1000 # 从第二个文件抽取的行数 (例如：抽取500行)
+NUM_SAMPLES_FILE2 = 1300 # 从第二个文件抽取的行数 (例如：抽取500行)
 
 # 要从最终合并文件中删除的列名列表 (如果不需要删除列，请设置为空列表 [])
 COLUMNS_TO_DELETE = ['noes_score', 'pm_score'] # 例如: ['多余列A', '临时数据列']

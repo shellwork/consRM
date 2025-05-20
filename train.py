@@ -583,10 +583,10 @@ def main():
     
     # 2. 应用SMOTE过采样 - 可以根据需要调整比例
     # 取消注释以下行使用SMOTE
-    # train_bert_features, train_features, train_labels = apply_smote(
-    #     train_bert_features, train_features, train_labels, 
-    #     sampling_strategy=0.5  # 设置少数类与多数类的比例
-    # )
+    train_bert_features, train_features, train_labels = apply_smote(
+        train_bert_features, train_features, train_labels, 
+        sampling_strategy=0.7  # 设置少数类与多数类的比例
+    )
     
     # 创建优化的数据集
     train_dataset = OptimizedDNADataset(train_bert_features, train_features, train_labels)

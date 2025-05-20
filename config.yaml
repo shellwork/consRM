@@ -32,7 +32,7 @@ model:
 
 # 训练参数
 training:
-  batch_size: 128                # 批大小 
+  batch_size: 256                # 批大小 
   learning_rate: 5e-5            # 学习率
   num_epochs: 20                 # 最大训练轮数
   patience: 5                    # 早停耐心值

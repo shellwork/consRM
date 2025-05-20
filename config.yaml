@@ -13,7 +13,7 @@ inference:
   num_workers: 16
   
   # 是否使用自动混合精度 (Automatic Mixed Precision): 有问题别开
-  use_amp: false
+  use_amp: true
   
   # 是否使用梯度检查点 (通常在推理阶段不需要，但可以作为控制内存使用的选项)
   use_gradient_checkpointing: false
@@ -33,8 +33,8 @@ model:
 # 训练参数
 training:
   batch_size: 128                # 批大小 
-  learning_rate: 1e-3            # 学习率
-  num_epochs: 50                 # 最大训练轮数
+  learning_rate: 5e-5            # 学习率
+  num_epochs: 20                 # 最大训练轮数
   patience: 5                    # 早停耐心值
   max_seq_length: 512            # 序列最大长度
 

@@ -7,10 +7,12 @@ import pandas as pd
 import yaml
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from transformers import AutoTokenizer, AutoModel, BertModel, BertConfig
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from imblearn.over_sampling import SMOTE
+from torch.utils.data.sampler import WeightedRandomSampler
 
 # 加载配置文件
 def load_config(config_path="config.yaml"):
@@ -31,66 +33,6 @@ def get_device(device_config):
     if device_config == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_config)
-
-# original version
-# class BertFeatureExtractor:
-#     def __init__(self, model_path, tokenizer, max_length, device):
-#         self.tokenizer = tokenizer
-#         self.max_length = max_length
-#         self.device = device
-#         config = load_config()
-#         # 加载预训练的BERT模型 - 使用BertModel而不是AutoModel避免配置冲突
-#         trust_remote_code = config['loading']['trust_remote_code']
-#         local_files_only = config['loading']['local_files_only']
-#         self.model = BertModel.from_pretrained(
-#             model_path,
-#             trust_remote_code=trust_remote_code,
-#             local_files_only=local_files_only
-#         ).to(device)
-#         print("Successfully loaded BERT model")
-        
-#         # 设置模型为评估模式，禁用dropout等
-#         self.model.eval()
-    
-#     def extract_features(self, sequences, batch_size=32):
-#         """从序列中提取BERT特征"""
-#         features = []
-        
-#         # 确保所有序列都是字符串类型
-#         sequences = [str(seq) for seq in sequences]
-        
-#         # 检查数据类型
-#         print(f"Sequences type: {type(sequences)}")
-#         print(f"First sequence type: {type(sequences[0])}")
-#         # print(f"First few sequences: {sequences[:3]}")
-        
-#         # 分批处理序列以避免OOM
-#         for i in tqdm(range(0, len(sequences), batch_size), desc="提取BERT特征"):
-#             batch_sequences = sequences[i:i+batch_size]
-            
-#             try:
-#                 # 对批次进行编码
-#                 encoding = self.tokenizer(
-#                     batch_sequences,
-#                     padding='max_length',
-#                     truncation=True,
-#                     max_length=self.max_length,
-#                     return_tensors='pt'
-#                 ).to(self.device)
-                
-#                 # 不计算梯度
-#                 with torch.no_grad():
-#                     outputs = self.model(**encoding)
-#                     # 获取[CLS]标记的嵌入，代表整个序列的表示
-#                     batch_features = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-#                     features.append(batch_features)
-#             except Exception as e:
-#                 print(f"Error processing batch {i}-{i+batch_size}: {e}")
-#                 print(f"Problematic batch: {batch_sequences}")
-#                 raise
-        
-#         # 合并所有批次的特征
-#         return np.vstack(features)
 
 # 特征提取类 - 用于预先提取BERT特征
 class BertFeatureExtractor:
@@ -230,37 +172,88 @@ class OptimizedDNADataset(Dataset):
 class DNAClassifier(nn.Module):
     def __init__(self, config):
         super(DNAClassifier, self).__init__()
-        bert_dim = 768  # BERT输出维度通常是768
+        bert_dim = 768  # BERT output dimension
         feature_dim = config['model']['feature_dim']
         hidden_dim = config['model']['hidden_dim']
         dropout_rate = config['model']['dropout_rate']
         
-        # 特征编码器 - 处理额外特征
+        # Enhanced feature encoder with batch normalization
         self.feature_encoder = nn.Sequential(
-            nn.Linear(feature_dim, 32),
-            nn.ReLU()
+            nn.Linear(feature_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate/2)
         )
         
-        # 分类器 - 结合BERT特征和额外特征
-        self.classifier = nn.Sequential(
-            nn.Linear(bert_dim + 32, hidden_dim),
+        # Batch normalization for BERT features
+        self.bert_norm = nn.BatchNorm1d(bert_dim)
+        
+        # Deeper classifier with residual connections
+        self.classifier_1 = nn.Sequential(
+            nn.Linear(bert_dim + 64, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # Residual block
+        self.residual_block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate/2),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim)
+        )
+        
+        # Output layer
+        self.classifier_2 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
     
     def forward(self, bert_features, additional_features):
-        # 对额外特征进行编码
+        # Normalize BERT features
+        bert_features = self.bert_norm(bert_features)
+        
+        # Process additional features
         encoded_features = self.feature_encoder(additional_features)
         
-        # 融合BERT特征和额外特征
+        # Concatenate features
         fused_features = torch.cat((bert_features, encoded_features), dim=1)
         
-        # 分类预测
-        output = self.classifier(fused_features)
+        # First classifier layer
+        x = self.classifier_1(fused_features)
+        
+        # Residual connection
+        residual = x
+        x = self.residual_block(x)
+        x = x + residual  # Add residual connection
+        
+        # Output layer
+        output = self.classifier_2(x)
         
         return output.squeeze()
+
+# 计算样本权重以处理不平衡数据
+def calculate_class_weights(labels):
+    # 计算类别频率
+    class_counts = np.bincount(labels.astype(int))
+    # 计算权重（少数类获得更高权重）
+    weights = 1.0 / class_counts
+    # 归一化权重，使其总和为len(labels)
+    weights = weights * len(labels) / np.sum(weights * class_counts)
+    
+    # 为每个数据点分配权重
+    sample_weights = np.zeros(len(labels))
+    for i, label in enumerate(labels):
+        sample_weights[i] = weights[int(label)]
+    
+    return sample_weights, weights
 
 # 数据加载
 def load_data(file_path):
@@ -273,18 +266,48 @@ def load_data(file_path):
     # 检查数据
     print(f"Data shapes - Sequences: {sequences.shape}, Features: {features.shape}, Labels: {labels.shape}")
     print(f"Sequence data type: {type(sequences)}, Element type: {type(sequences[0]) if len(sequences) > 0 else 'N/A'}")
-    print(f"Sample sequences: {sequences[:3]}")
+    # print(f"Sample sequences: {sequences[:3]}")
+    
+    # 打印类别分布情况
+    unique, counts = np.unique(labels, return_counts=True)
+    print("类别分布:")
+    for u, c in zip(unique, counts):
+        print(f"类别 {u}: {c} 样本 ({c/len(labels)*100:.2f}%)")
     
     return sequences, features, labels
 
+# 应用SMOTE过采样技术对少数类进行采样
+def apply_smote(bert_features, additional_features, labels, sampling_strategy=0.5):
+    combined_features = np.hstack((bert_features, additional_features))
+    
+    # Use a more conservative sampling strategy with k_neighbors tuned to your dataset size
+    smote = SMOTE(sampling_strategy=0.7, k_neighbors=min(5, sum(labels == 1) - 1), random_state=42)
+    combined_features_resampled, labels_resampled = smote.fit_resample(combined_features, labels)
+    
+    # Split back into separate feature sets
+    bert_features_resampled = combined_features_resampled[:, :bert_features.shape[1]]
+    additional_features_resampled = combined_features_resampled[:, bert_features.shape[1]:]
+    
+    return bert_features_resampled, additional_features_resampled, labels_resampled
+
 # 训练模型
-def train_model(model, train_loader, val_loader, criterion, optimizer, config, device):
+def train_model(model, train_loader, val_loader, criterion, optimizer, config, device, class_weights=None):
     patience = config['training']['patience']
     num_epochs = config['training']['num_epochs']
     
     best_val_loss = float('inf')
+    best_f1 = 0.0
     patience_counter = 0
-    training_history = {'train_loss': [], 'val_loss': [], 'val_accuracy': [], 'val_auc': []}
+    training_history = {
+        'train_loss': [], 'val_loss': [], 
+        'val_accuracy': [], 'val_precision': [], 
+        'val_recall': [], 'val_f1': [], 'val_auc': []
+    }
+    
+    # 设置类别权重给BCE损失函数
+    if class_weights is not None and isinstance(criterion, nn.BCELoss):
+        criterion = nn.BCELoss(weight=torch.tensor([class_weights[1]]).to(device))
+        print(f"设置BCELoss的权重为: {class_weights[1]}")
     
     for epoch in range(num_epochs):
         model.train()
@@ -312,30 +335,42 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, config, d
         avg_train_loss = total_loss / len(train_loader)
         
         # 验证阶段
-        val_loss, val_accuracy, val_auc = evaluate_model(model, val_loader, criterion, device)
+        val_metrics = evaluate_model(model, val_loader, criterion, device)
+        val_loss = val_metrics['loss']
+        val_accuracy = val_metrics['accuracy']
+        val_precision = val_metrics['precision']
+        val_recall = val_metrics['recall']
+        val_f1 = val_metrics['f1']
+        val_auc = val_metrics['auc']
         
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}, Val AUC: {val_auc:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}, "
+              f"Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+              f"Val Acc: {val_accuracy:.4f}, Val Prec: {val_precision:.4f}, "
+              f"Val Recall: {val_recall:.4f}, Val F1: {val_f1:.4f}, Val AUC: {val_auc:.4f}")
         
         # 记录训练历史
         training_history['train_loss'].append(avg_train_loss)
         training_history['val_loss'].append(val_loss)
         training_history['val_accuracy'].append(val_accuracy)
+        training_history['val_precision'].append(val_precision)
+        training_history['val_recall'].append(val_recall)
+        training_history['val_f1'].append(val_f1)
         training_history['val_auc'].append(val_auc)
         
         # 早停策略
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_f1 > best_f1:
+            best_f1 = val_f1
             patience_counter = 0
             # 保存最佳模型
             torch.save(model.state_dict(), 'best_dna_classifier.pth')
-            print("Model saved!")
-        else:
-            patience_counter += 1
-            print(f"Early stopping counter: {patience_counter}/{patience}")
+            print(f"保存模型! 最佳验证F1: {best_f1:.4f}")
+#         else:
+#             patience_counter += 1
+#             print(f"早停计数器: {patience_counter}/{patience}")
             
-            if patience_counter >= patience:
-                print("Early stopping triggered!")
-                break
+#             if patience_counter >= patience:
+#                 print("早停触发!")
+#                 break
     
     return training_history
 
@@ -344,6 +379,7 @@ def evaluate_model(model, data_loader, criterion, device):
     model.eval()
     total_loss = 0
     all_preds = []
+    all_probs = []  # 保存原始概率值用于计算AUC
     all_labels = []
     
     with torch.no_grad():
@@ -360,42 +396,125 @@ def evaluate_model(model, data_loader, criterion, device):
             total_loss += loss.item()
             
             # 收集预测结果和标签
-            predictions = (outputs > 0.5).float().cpu().numpy()
+            probs = outputs.cpu().numpy()
+            predictions = (probs > 0.5).astype(float)
+            all_probs.extend(probs)
             all_preds.extend(predictions)
             all_labels.extend(labels.cpu().numpy())
     
+    # 将列表转换为数组以便计算
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    
     # 计算评估指标
     accuracy = accuracy_score(all_labels, all_preds)
-    try:
-        auc = roc_auc_score(all_labels, all_preds)
-    except:
-        auc = 0.5  # 如果只有一个类别，AUC计算会失败
     
-    return total_loss / len(data_loader), accuracy, auc
+    # 处理特殊情况
+    if len(np.unique(all_labels)) == 1:  # 只有一个类别
+        precision = 0 if np.sum(all_preds) == 0 else 1.0
+        recall = 0 if all_labels[0] == 1 else 1.0
+        f1 = 0
+        auc = 0.5
+    else:
+        precision = precision_score(all_labels, all_preds)
+        recall = recall_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds)
+        auc = roc_auc_score(all_labels, all_probs)
+    
+    # 显示混淆矩阵
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    print("\n混淆矩阵:")
+    print(conf_matrix)
+    print(f"TP: {conf_matrix[1][1]}, FP: {conf_matrix[0][1]}")
+    print(f"FN: {conf_matrix[1][0]}, TN: {conf_matrix[0][0]}")
+    
+    return {
+        'loss': total_loss / len(data_loader),
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc
+    }
 
 # 可视化训练历史
 def plot_training_history(history):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
     
     # 损失曲线
-    ax1.plot(history['train_loss'], label='Train Loss')
-    ax1.plot(history['val_loss'], label='Validation Loss')
-    ax1.set_xlabel('Epochs')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training and Validation Loss')
-    ax1.legend()
+    axes[0, 0].plot(history['train_loss'], label='Train Loss')
+    axes[0, 0].plot(history['val_loss'], label='Validation Loss')
+    axes[0, 0].set_xlabel('Epochs')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
     
-    # 准确率和AUC曲线
-    ax2.plot(history['val_accuracy'], label='Validation Accuracy')
-    ax2.plot(history['val_auc'], label='Validation AUC')
-    ax2.set_xlabel('Epochs')
-    ax2.set_ylabel('Score')
-    ax2.set_title('Validation Metrics')
-    ax2.legend()
+    # 准确率曲线
+    axes[0, 1].plot(history['val_accuracy'], label='Accuracy')
+    axes[0, 1].plot(history['val_auc'], label='AUC')
+    axes[0, 1].set_xlabel('Epochs')
+    axes[0, 1].set_ylabel('Score')
+    axes[0, 1].set_title('Validation Accuracy and AUC')
+    axes[0, 1].legend()
+    
+    # 精确度和召回率曲线
+    axes[1, 0].plot(history['val_precision'], label='Precision')
+    axes[1, 0].plot(history['val_recall'], label='Recall')
+    axes[1, 0].set_xlabel('Epochs')
+    axes[1, 0].set_ylabel('Score')
+    axes[1, 0].set_title('Validation Precision and Recall')
+    axes[1, 0].legend()
+    
+    # F1分数曲线
+    axes[1, 1].plot(history['val_f1'], label='F1 Score')
+    axes[1, 1].set_xlabel('Epochs')
+    axes[1, 1].set_ylabel('Score')
+    axes[1, 1].set_title('Validation F1 Score')
+    axes[1, 1].legend()
     
     plt.tight_layout()
     plt.savefig('training_history.png')
     plt.show()
+
+# 使用加权损失函数处理不平衡数据
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.75, gamma=2.0, reduction='mean', pos_weight=None):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.pos_weight = pos_weight  # Weight for positive class
+    
+    def forward(self, inputs, targets):
+        # Apply weights to BCE loss
+        if self.pos_weight is not None:
+            weights = torch.ones_like(targets)
+            weights[targets == 1] = self.pos_weight
+            BCE_loss = nn.BCELoss(reduction='none', weight=weights)(inputs, targets)
+        else:
+            BCE_loss = nn.BCELoss(reduction='none')(inputs, targets)
+            
+        pt = torch.exp(-BCE_loss)  # Prediction confidence
+        
+        # Apply focal weighting
+        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
+        
+        if self.reduction == 'mean':
+            return torch.mean(F_loss)
+        elif self.reduction == 'sum':
+            return torch.sum(F_loss)
+        else:
+            return F_loss
+
+# 为WeightedRandomSampler创建样本权重
+def create_weighted_sampler(labels):
+    class_counts = np.bincount(labels.astype(int))
+    class_weights = 1. / class_counts
+    sample_weights = class_weights[labels.astype(int)]
+    sample_weights = torch.from_numpy(sample_weights).float()
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+    return sampler
 
 # 主函数
 def main():
@@ -433,12 +552,12 @@ def main():
     data_file = config['data']['file_path']
     sequences, additional_features, labels = load_data(data_file)
     
-    # 划分训练集和验证集
+    # 划分训练集和验证集 - 分层采样保持类别分布
     train_seqs, val_seqs, train_features, val_features, train_labels, val_labels = train_test_split(
         sequences, additional_features, labels, 
         test_size=config['data']['test_size'], 
         random_state=config['data']['random_seed'],
-        stratify=labels
+        stratify=labels  # 确保训练集和验证集有相似的类别分布
     )
     
     print(f"Train set size: {len(train_seqs)}, Validation set size: {len(val_seqs)}")
@@ -457,16 +576,34 @@ def main():
     
     print(f"BERT feature dimension: {train_bert_features.shape[1]}")
     
+    # 处理类别不平衡 - 可选择使用SMOTE或类别权重
+    # 1. 计算类别权重
+    _, class_weights = calculate_class_weights(train_labels)
+    print(f"类别权重: {class_weights}")
+    
+    # 2. 应用SMOTE过采样 - 可以根据需要调整比例
+    # 取消注释以下行使用SMOTE
+    # train_bert_features, train_features, train_labels = apply_smote(
+    #     train_bert_features, train_features, train_labels, 
+    #     sampling_strategy=0.5  # 设置少数类与多数类的比例
+    # )
+    
     # 创建优化的数据集
     train_dataset = OptimizedDNADataset(train_bert_features, train_features, train_labels)
     val_dataset = OptimizedDNADataset(val_bert_features, val_features, val_labels)
     
-    # 创建数据加载器
+    # 创建带加权采样器的数据加载器
     batch_size = config['training']['batch_size']
+    
+    # 使用WeightedRandomSampler处理不平衡
+    # train_sampler = create_weighted_sampler(train_labels)
+    # train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler)
+    
+    # 如果使用了SMOTE，就不需要加权采样器
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     
-    # 创建分类器模型 (不包含BERT部分)
+    # 创建分类器模型
     model = DNAClassifier(config).to(device)
     
     # 打印模型信息
@@ -475,13 +612,17 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total trainable parameters: {total_params:,}")
     
-    # 定义损失函数和优化器
-    criterion = nn.BCELoss()
+    # 定义损失函数 - 使用Focal Loss或加权BCE来处理不平衡数据
+    # criterion = nn.BCELoss()  # 标准交叉熵损失
+    # criterion = nn.BCELoss(weight=torch.tensor([class_weights[1]]).to(device))  # 加权BCE
+    criterion = FocalLoss(alpha=0.75, gamma=2.0)  # Focal Loss
+    
+    # 定义优化器
     optimizer = optim.Adam(model.parameters(), lr=float(config['training']['learning_rate']))
     
     # 训练模型
     print("Training classification model...")
-    history = train_model(model, train_loader, val_loader, criterion, optimizer, config, device)
+    history = train_model(model, train_loader, val_loader, criterion, optimizer, config, device, class_weights)
     
     # 可视化训练过程
     plot_training_history(history)
@@ -490,8 +631,15 @@ def main():
     best_model = DNAClassifier(config).to(device)
     best_model.load_state_dict(torch.load('best_dna_classifier.pth'))
     
-    val_loss, val_accuracy, val_auc = evaluate_model(best_model, val_loader, criterion, device)
-    print(f"Best Model Evaluation - Validation Loss: {val_loss:.4f}, Accuracy: {val_accuracy:.4f}, AUC: {val_auc:.4f}")
+    # 对验证集进行全面评估
+    val_metrics = evaluate_model(best_model, val_loader, criterion, device)
+    print(f"\n最佳模型评估结果:")
+    print(f"验证损失: {val_metrics['loss']:.4f}")
+    print(f"准确率: {val_metrics['accuracy']:.4f}")
+    print(f"精确率: {val_metrics['precision']:.4f}")
+    print(f"召回率: {val_metrics['recall']:.4f}")
+    print(f"F1分数: {val_metrics['f1']:.4f}")
+    print(f"AUC: {val_metrics['auc']:.4f}")
 
 if __name__ == "__main__":
     main()

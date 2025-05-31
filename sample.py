@@ -15,11 +15,11 @@ OUTPUT_FILE_PATH = "data/c.csv" # 替换为希望保存的输出文件路径
 # 设置为 -1 表示抽取该文件的所有行
 # 设置为 0 表示不抽取该文件的任何行
 # 设置为正数 N 表示随机抽取 N 行
-NUM_SAMPLES_FILE1 = 1000   # 从第一个文件抽取的行数 (例如：抽取所有行)
-NUM_SAMPLES_FILE2 = 1300 # 从第二个文件抽取的行数 (例如：抽取500行)
+NUM_SAMPLES_FILE1 = 2000   # 从第一个文件抽取的行数 (例如：抽取所有行)
+NUM_SAMPLES_FILE2 = 1000 # 从第二个文件抽取的行数 (例如：抽取500行)
 
 # 要从最终合并文件中删除的列名列表 (如果不需要删除列，请设置为空列表 [])
-COLUMNS_TO_DELETE = ['noes_score', 'pm_score'] # 例如: ['多余列A', '临时数据列']
+COLUMNS_TO_DELETE = ['noes_score', 'pm_score', 'seq_score'] # 例如: ['多余列A', '临时数据列']
 
 # 随机种子 (用于可复现的抽样和打乱顺序，如果不需要可设为None)
 RANDOM_SEED = 42
@@ -162,19 +162,6 @@ if __name__ == "__main__":
        (NUM_SAMPLES_FILE2 < -1) :
         print("错误：配置中的抽样数量 (NUM_SAMPLES_FILE1 或 NUM_SAMPLES_FILE2) 不能为小于-1的负数。请修改配置 (-1 表示所有行)。")
     else:
-        # # --- 可选：创建示例 CSV 文件用于测试 ---
-        # print("正在创建示例文件用于测试...")
-        # if not os.path.exists("data"): os.makedirs("data")
-        # example_data1 = {'id': range(10), 'feature_a': [i*2 for i in range(10)], 'column_to_delete1': ['text1']*10, 'common_col': list('abcdefghij')}
-        # example_df1 = pd.DataFrame(example_data1)
-        # example_df1.to_csv(FILE1_PATH, index=False)
-        #
-        # example_data2 = {'id': range(100, 120), 'feature_b': [i*3 for i in range(20)], 'another_column_to_remove': ['text2']*20, 'common_col': list('klmnopqrstuvwxyzabcd')}
-        # example_df2 = pd.DataFrame(example_data2)
-        # example_df2.to_csv(FILE2_PATH, index=False)
-        # print(f"示例文件 '{FILE1_PATH}' 和 '{FILE2_PATH}' 已创建。\n")
-        # # --- 示例文件创建结束 ---
-
         sample_merge_process_csvs(
             FILE1_PATH, NUM_SAMPLES_FILE1,
             FILE2_PATH, NUM_SAMPLES_FILE2,

@@ -26,7 +26,7 @@ loading:
 # 模型参数
 model:
   bert_model_path: "embed_model" # DNABERT2模型路径
-  feature_dim: 1                 # 额外特征的维度
+  feature_dim: 3                 # 额外特征的维度
   hidden_dim: 64                # 分类器隐藏层维度
   dropout_rate: 0.3              # Dropout比例
 

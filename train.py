@@ -170,6 +170,7 @@ class OptimizedDNADataset(Dataset):
         }
 
 # 简化的分类器模型 - 只训练分类层
+import torch.nn.functional as F
 class DNAClassifier(nn.Module):
     def __init__(self, config, imbalance_ratio=1.0):
         super(DNAClassifier, self).__init__()
@@ -178,81 +179,93 @@ class DNAClassifier(nn.Module):
         hidden_dim = config['model']['hidden_dim']
         dropout_rate = config['model']['dropout_rate']
         
-        # 1. BERT特征标准化层
+        # A. Sequence Features Module (对应图中上半部分)
         self.bert_norm = nn.LayerNorm(bert_dim)
         
-        # 2. 表格特征处理 - 更深的网络
-        self.feature_encoder = nn.Sequential(
-            nn.Linear(feature_dim, 16),
-            nn.LayerNorm(16),
+        # 修复：使用适合单一向量的处理方式，而不是CNN
+        # 因为BERT特征是 [batch_size, 768] 的单一向量，不是序列
+        self.sequence_feature_processor = nn.Sequential(
+            nn.Linear(bert_dim, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.5),
-            
-            nn.Linear(16, 32),
-            nn.LayerNorm(32),
+            nn.Dropout(dropout_rate * 0.3),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.5),
+            nn.Dropout(dropout_rate * 0.3)
         )
         
-        # 3. 特征融合层 - 注意力机制
-        total_dim = bert_dim + 32
-        self.attention = nn.Sequential(
-            nn.Linear(total_dim, total_dim // 4),
-            nn.Tanh(),
-            nn.Linear(total_dim // 4, total_dim),
-            nn.Sigmoid()
+        # B. Physicochemical Features Module (对应图中下半部分)
+        # 特征工程预处理
+        self.feature_preprocessor = nn.Sequential(
+            nn.Linear(feature_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.3),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.3)
         )
         
-        # 4. 主分类器 - 渐进式降维
+        # C. 特征融合和分类
+        # 计算拼接后的特征维度
+        total_features = 128 + 32  # sequence features + physicochemical features
+        
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(total_features, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate * 0.5)
+        )
+        
+        # 最终分类器
         self.classifier = nn.Sequential(
-            nn.Linear(total_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Dropout(dropout_rate * 0.5),
-            
-            nn.Linear(hidden_dim // 4, 1)
+            nn.Linear(32, 1)
         )
         
-        # 5. 初始化权重
         self._initialize_weights()
-        
+    
     def _initialize_weights(self):
-        """改进的权重初始化"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
                 nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0)
     
     def forward(self, bert_features, additional_features):
-        # 1. 标准化BERT特征
+        batch_size = bert_features.size(0)
+        
+        # 确保输入维度正确
+        if len(bert_features.shape) != 2:
+            raise ValueError(f"Expected bert_features to be 2D [batch_size, 768], got shape {bert_features.shape}")
+        if len(additional_features.shape) != 2:
+            raise ValueError(f"Expected additional_features to be 2D [batch_size, feature_dim], got shape {additional_features.shape}")
+        
+        # A. 序列特征处理 - 直接处理BERT向量
         bert_features = self.bert_norm(bert_features)
+        sequence_features = self.sequence_feature_processor(bert_features)
         
-        # 2. 处理表格特征
-        encoded_features = self.feature_encoder(additional_features)
+        # B. 物理化学特征处理
+        physicochemical_features = self.feature_preprocessor(additional_features)
         
-        # 3. 特征拼接
-        fused_features = torch.cat((bert_features, encoded_features), dim=1)
+        # C. 特征拼接和融合
+        fused_features = torch.cat([sequence_features, physicochemical_features], dim=1)
+        fused_features = self.feature_fusion(fused_features)
         
-        # 4. 注意力加权
-        attention_weights = self.attention(fused_features)
-        weighted_features = fused_features * attention_weights
-        
-        # 5. 分类
-        logits = self.classifier(weighted_features)
+        # 最终分类
+        logits = self.classifier(fused_features)
         return torch.sigmoid(logits).squeeze()
 
 # 计算样本权重以处理不平衡数据
@@ -317,7 +330,7 @@ def load_data(file_path):
     df = pd.read_csv(file_path)
     sequences = df['sequence'].values
     # features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
-    features = df[['phastCons']].values
+    features = df[['noes_score', 'seq_score', 'phastCons']].values
     labels = df['label'].values
     
     # 检查数据
@@ -664,7 +677,6 @@ def create_weighted_sampler(labels):
     return sampler
 
 # 主函数
-# 主函数
 def main():
     # 加载配置
     config = load_config()
@@ -723,7 +735,6 @@ def main():
     
     print(f"BERT feature dimension: {train_bert_features.shape[1]}")
     
-    # 处理类别不平衡 - 应用SMOTE过采样
     # 处理类别不平衡 - 根据类别分布情况决定是否应用SMOTE
     pos_ratio = np.sum(train_labels) / len(train_labels)
     print(f"训练集正样本比例: {pos_ratio:.4f}")

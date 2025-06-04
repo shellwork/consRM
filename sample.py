@@ -15,12 +15,12 @@ OUTPUT_FILE_PATH = "data/c.csv" # 替换为希望保存的输出文件路径
 # 设置为 -1 表示抽取该文件的所有行
 # 设置为 0 表示不抽取该文件的任何行
 # 设置为正数 N 表示随机抽取 N 行
-NUM_SAMPLES_FILE1 = 2000   # 从第一个文件抽取的行数 (例如：抽取所有行)
-NUM_SAMPLES_FILE2 = 1000 # 从第二个文件抽取的行数 (例如：抽取500行)
+NUM_SAMPLES_FILE1 = -1   # 从第一个文件抽取的行数 (例如：抽取所有行)
+NUM_SAMPLES_FILE2 = -1 # 从第二个文件抽取的行数 (例如：抽取500行)
 
 # 要从最终合并文件中删除的列名列表 (如果不需要删除列，请设置为空列表 [])
-COLUMNS_TO_DELETE = ['noes_score', 'pm_score', 'seq_score'] # 例如: ['多余列A', '临时数据列']
-
+# COLUMNS_TO_DELETE = ['noes_score', 'pm_score', 'seq_score', 'phastCons'] # 例如: ['多余列A', '临时数据列']
+COLUMNS_TO_DELETE = ['pm_score']
 # 随机种子 (用于可复现的抽样和打乱顺序，如果不需要可设为None)
 RANDOM_SEED = 42
 # --- 配置结束 ---

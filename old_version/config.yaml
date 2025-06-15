@@ -25,18 +25,23 @@ loading:
 
 # 模型参数
 model:
-  bert_model_path: "embed_model" # DNABERT2模型路径
-  feature_dim: 3                 # 额外特征的维度
-  hidden_dim: 64                # 分类器隐藏层维度
-  dropout_rate: 0.3              # Dropout比例
+  bert_model_path: "embed_model"
+  feature_dim: 2
+  hidden_dim: 64                # 增加到64，提高模型容量
+  dropout_rate: 0.3             # 大幅提高dropout，从0.55到0.7
+  alpha: 0.4                    # 降低到0.4，减少对困难样本的过度关注
+  gamma: 1.5                    # 大幅降低到1.5，减少focal loss的极端效应
+  label_smoothing: 0.1          # 增加到0.1，提高泛化能力
+  l1: 0.005                     # 降低L1正则化，避免过度稀疏
+  l2: 0.015                     # 适度增加L2正则化
 
-# 训练参数
+# 训练参数 - 稳定性优化
 training:
-  batch_size: 128                # 批大小 
-  learning_rate: 5e-5            # 学习率
-  num_epochs: 20                 # 最大训练轮数
-  patience: 5                    # 早停耐心值
-  max_seq_length: 512            # 序列最大长度
+  batch_size: 32                # 减小batch size，提高训练稳定性
+  learning_rate: 3e-4           # 进一步降低学习率，从6e-4到3e-4
+  num_epochs: 25                # 减少最大轮数，避免过拟合
+  patience: 8                   # 适度调整早停耐心值
+  max_seq_length: 512
 
 # 设备配置
 device: "auto"                   # 可选: "auto", "cuda", "cpu"

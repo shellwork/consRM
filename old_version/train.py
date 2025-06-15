@@ -7,7 +7,7 @@ import pandas as pd
 import yaml
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler  # 改进：使用RobustScaler替代StandardScaler
+from sklearn.preprocessing import RobustScaler 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from transformers import AutoTokenizer, AutoModel, BertModel, BertConfig
 import matplotlib.pyplot as plt
@@ -171,6 +171,8 @@ class OptimizedDNADataset(Dataset):
 
 # 简化的分类器模型 - 只训练分类层
 import torch.nn.functional as F
+
+# 如果你想保留CNN架构，可以使用这个版本（适用于序列数据）
 class DNAClassifier(nn.Module):
     def __init__(self, config, imbalance_ratio=1.0):
         super(DNAClassifier, self).__init__()
@@ -179,64 +181,70 @@ class DNAClassifier(nn.Module):
         hidden_dim = config['model']['hidden_dim']
         dropout_rate = config['model']['dropout_rate']
         
-        # A. Sequence Features Module (对应图中上半部分)
+        # A. Sequence Features Module
         self.bert_norm = nn.LayerNorm(bert_dim)
         
-        # 修复：使用适合单一向量的处理方式，而不是CNN
-        # 因为BERT特征是 [batch_size, 768] 的单一向量，不是序列
-        self.sequence_feature_processor = nn.Sequential(
-            nn.Linear(bert_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.3),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.3)
-        )
+        # 修复：改进的CNN架构，确保输出尺寸正确
+        self.sequence_conv_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 64, kernel_size=k, padding=k//2),  # 输入通道改为1
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(32)  # 使用自适应池化确保固定输出尺寸
+            ) for k in [3, 5, 7]
+        ])
         
-        # B. Physicochemical Features Module (对应图中下半部分)
-        # 特征工程预处理
+        # B. Physicochemical Features Module
         self.feature_preprocessor = nn.Sequential(
             nn.Linear(feature_dim, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.3),
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
             nn.Dropout(dropout_rate * 0.3)
         )
         
+        # 物理化学特征也使用CNN处理
+        self.physicochemical_conv_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 32, kernel_size=k, padding=k//2),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool1d(16)  # 固定输出尺寸
+            ) for k in [3, 5]
+        ])
+        
         # C. 特征融合和分类
         # 计算拼接后的特征维度
-        total_features = 128 + 32  # sequence features + physicochemical features
+        seq_conv_features = len(self.sequence_conv_blocks) * 64 * 32  # 3 * 64 * 32
+        phys_conv_features = len(self.physicochemical_conv_blocks) * 32 * 16  # 2 * 32 * 16
+        total_conv_features = seq_conv_features + phys_conv_features
         
         self.feature_fusion = nn.Sequential(
-            nn.Linear(total_features, 128),
+            nn.Linear(total_conv_features, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate)
+        )
+        
+        # 最终分类器
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.5)
-        )
-        
-        # 最终分类器
-        self.classifier = nn.Sequential(
-            nn.Linear(64, 32),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
             nn.Dropout(dropout_rate * 0.5),
-            nn.Linear(32, 1)
+            nn.Linear(64, 1)
         )
         
         self._initialize_weights()
     
     def _initialize_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Linear):
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -247,26 +255,139 @@ class DNAClassifier(nn.Module):
     def forward(self, bert_features, additional_features):
         batch_size = bert_features.size(0)
         
-        # 确保输入维度正确
-        if len(bert_features.shape) != 2:
-            raise ValueError(f"Expected bert_features to be 2D [batch_size, 768], got shape {bert_features.shape}")
-        if len(additional_features.shape) != 2:
-            raise ValueError(f"Expected additional_features to be 2D [batch_size, feature_dim], got shape {additional_features.shape}")
-        
-        # A. 序列特征处理 - 直接处理BERT向量
+        # A. 序列特征处理
         bert_features = self.bert_norm(bert_features)
-        sequence_features = self.sequence_feature_processor(bert_features)
+        
+        # 将BERT特征reshape为CNN输入格式 [batch_size, 1, bert_dim]
+        bert_features_reshaped = bert_features.unsqueeze(1)  # [batch_size, 1, 768]
+        
+        # 多尺度序列卷积
+        sequence_conv_outputs = []
+        for conv_block in self.sequence_conv_blocks:
+            conv_out = conv_block(bert_features_reshaped)  # [batch_size, 64, 32]
+            # 展平
+            flattened = conv_out.view(batch_size, -1)  # [batch_size, 64*32]
+            sequence_conv_outputs.append(flattened)
         
         # B. 物理化学特征处理
-        physicochemical_features = self.feature_preprocessor(additional_features)
+        processed_features = self.feature_preprocessor(additional_features)
+        processed_features_reshaped = processed_features.unsqueeze(1)  # [batch_size, 1, 64]
         
-        # C. 特征拼接和融合
-        fused_features = torch.cat([sequence_features, physicochemical_features], dim=1)
+        # 多尺度物理化学卷积
+        physicochemical_conv_outputs = []
+        for conv_block in self.physicochemical_conv_blocks:
+            conv_out = conv_block(processed_features_reshaped)  # [batch_size, 32, 16]
+            # 展平
+            flattened = conv_out.view(batch_size, -1)  # [batch_size, 32*16]
+            physicochemical_conv_outputs.append(flattened)
+        
+        # C. 特征拼接和分类
+        all_features = sequence_conv_outputs + physicochemical_conv_outputs
+        fused_features = torch.cat(all_features, dim=1)
+        
+        # 特征融合
         fused_features = self.feature_fusion(fused_features)
         
         # 最终分类
         logits = self.classifier(fused_features)
         return torch.sigmoid(logits).squeeze()
+    
+# class DNAClassifier(nn.Module):
+#     def __init__(self, config, imbalance_ratio=1.0):
+#         super(DNAClassifier, self).__init__()
+#         bert_dim = 768
+#         feature_dim = config['model']['feature_dim']
+#         hidden_dim = config['model']['hidden_dim']
+#         dropout_rate = config['model']['dropout_rate']
+        
+#         # A. Sequence Features Module (对应图中上半部分)
+#         self.bert_norm = nn.LayerNorm(bert_dim)
+        
+#         # 修复：使用适合单一向量的处理方式，而不是CNN
+#         # 因为BERT特征是 [batch_size, 768] 的单一向量，不是序列
+#         self.sequence_feature_processor = nn.Sequential(
+#             nn.Linear(bert_dim, 256),
+#             nn.BatchNorm1d(256),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate * 0.3),
+#             nn.Linear(256, 128),
+#             nn.BatchNorm1d(128),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate * 0.3)
+#         )
+        
+#         # B. Physicochemical Features Module (对应图中下半部分)
+#         # 特征工程预处理
+#         self.feature_preprocessor = nn.Sequential(
+#             nn.Linear(feature_dim, 64),
+#             nn.BatchNorm1d(64),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate * 0.3),
+#             nn.Linear(64, 32),
+#             nn.BatchNorm1d(32),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate * 0.3)
+#         )
+        
+#         # C. 特征融合和分类
+#         # 计算拼接后的特征维度
+#         total_features = 128 + 32  # sequence features + physicochemical features
+        
+#         self.feature_fusion = nn.Sequential(
+#             nn.Linear(total_features, 128),
+#             nn.BatchNorm1d(128),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(128, 64),
+#             nn.BatchNorm1d(64),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate * 0.5)
+#         )
+        
+#         # 最终分类器
+#         self.classifier = nn.Sequential(
+#             nn.Linear(64, 32),
+#             nn.BatchNorm1d(32),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate * 0.5),
+#             nn.Linear(32, 1)
+#         )
+        
+#         self._initialize_weights()
+    
+#     def _initialize_weights(self):
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear):
+#                 nn.init.xavier_uniform_(m.weight)
+#                 if m.bias is not None:
+#                     nn.init.constant_(m.bias, 0)
+#             elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
+#                 nn.init.constant_(m.weight, 1.0)
+#                 nn.init.constant_(m.bias, 0)
+    
+#     def forward(self, bert_features, additional_features):
+#         batch_size = bert_features.size(0)
+        
+#         # 确保输入维度正确
+#         if len(bert_features.shape) != 2:
+#             raise ValueError(f"Expected bert_features to be 2D [batch_size, 768], got shape {bert_features.shape}")
+#         if len(additional_features.shape) != 2:
+#             raise ValueError(f"Expected additional_features to be 2D [batch_size, feature_dim], got shape {additional_features.shape}")
+        
+#         # A. 序列特征处理 - 直接处理BERT向量
+#         bert_features = self.bert_norm(bert_features)
+#         sequence_features = self.sequence_feature_processor(bert_features)
+        
+#         # B. 物理化学特征处理
+#         physicochemical_features = self.feature_preprocessor(additional_features)
+        
+#         # C. 特征拼接和融合
+#         fused_features = torch.cat([sequence_features, physicochemical_features], dim=1)
+#         fused_features = self.feature_fusion(fused_features)
+        
+#         # 最终分类
+#         logits = self.classifier(fused_features)
+#         return torch.sigmoid(logits).squeeze()
 
 # 计算样本权重以处理不平衡数据
 def calculate_class_weights(labels):
@@ -330,7 +451,7 @@ def load_data(file_path):
     df = pd.read_csv(file_path)
     sequences = df['sequence'].values
     # features = df[['noes_score', 'pm_score', 'seq_score', 'phastCons']].values
-    features = df[['noes_score', 'seq_score', 'phastCons']].values
+    features = df[['seq_score', 'phastCons']].values
     labels = df['label'].values
     
     # 检查数据
@@ -362,14 +483,36 @@ def apply_smote(bert_features, additional_features, labels, sampling_strategy=0.
 
 # 改进：自适应Focal Loss
 class AdaptiveFocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, pos_weight=None, label_smoothing=0.0):
+    def __init__(self, alpha=None, gamma=2.0, pos_weight=None, label_smoothing=0.0, 
+                 l1_lambda=0.0, l2_lambda=0.0):
+        """
+        自适应Focal损失函数，支持L1和L2正则化
+        
+        Args:
+            alpha: 类别权重平衡参数
+            gamma: Focal loss的focusing参数
+            pos_weight: 正样本权重
+            label_smoothing: 标签平滑参数
+            l1_lambda: L1正则化系数
+            l2_lambda: L2正则化系数
+        """
         super(AdaptiveFocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.pos_weight = pos_weight
         self.label_smoothing = label_smoothing
+        self.l1_lambda = l1_lambda
+        self.l2_lambda = l2_lambda
     
-    def forward(self, inputs, targets):
+    def forward(self, inputs, targets, model=None):
+        """
+        前向传播
+        
+        Args:
+            inputs: 模型预测输出
+            targets: 真实标签
+            model: 模型对象，用于计算正则化项（可选）
+        """
         # 标签平滑
         if self.label_smoothing > 0:
             targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
@@ -392,9 +535,86 @@ class AdaptiveFocalLoss(nn.Module):
                              1 - self.alpha if self.alpha else 1.0)
         
         focal_loss = alpha_t * (1 - p_t) ** self.gamma * bce_loss
+        base_loss = focal_loss.mean()
         
-        return focal_loss.mean()
-
+        # 添加正则化项
+        total_loss = base_loss
+        
+        if model is not None and (self.l1_lambda > 0 or self.l2_lambda > 0):
+            reg_loss = self._compute_regularization(model)
+            total_loss = total_loss + reg_loss
+            
+        return total_loss
+    
+    def _compute_regularization(self, model):
+        """计算L1和L2正则化项"""
+        l1_reg = torch.tensor(0., device=next(model.parameters()).device)
+        l2_reg = torch.tensor(0., device=next(model.parameters()).device)
+        
+        for param in model.parameters():
+            if param.requires_grad:
+                if self.l1_lambda > 0:
+                    l1_reg += torch.norm(param, p=1)
+                if self.l2_lambda > 0:
+                    l2_reg += torch.norm(param, p=2)
+        
+        return self.l1_lambda * l1_reg + self.l2_lambda * l2_reg
+    
+    def get_loss_components(self, inputs, targets, model=None):
+        """
+        返回损失函数的各个组成部分，用于调试和监控
+        
+        Returns:
+            dict: 包含各个损失组件的字典
+        """
+        # 标签平滑
+        smoothed_targets = targets
+        if self.label_smoothing > 0:
+            smoothed_targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        
+        # 计算BCE损失
+        if self.pos_weight is not None:
+            bce_loss = nn.functional.binary_cross_entropy(
+                inputs, smoothed_targets, reduction='none'
+            )
+            weights = torch.where(smoothed_targets >= 0.5, self.pos_weight, 1.0)
+            bce_loss = bce_loss * weights
+        else:
+            bce_loss = nn.functional.binary_cross_entropy(inputs, smoothed_targets, reduction='none')
+        
+        # Focal loss调制
+        p_t = torch.where(smoothed_targets >= 0.5, inputs, 1 - inputs)
+        alpha_t = torch.where(smoothed_targets >= 0.5, 
+                             self.alpha if self.alpha else 1.0, 
+                             1 - self.alpha if self.alpha else 1.0)
+        
+        focal_loss = alpha_t * (1 - p_t) ** self.gamma * bce_loss
+        base_loss = focal_loss.mean()
+        
+        loss_components = {
+            'focal_loss': base_loss.item(),
+            'l1_reg': 0.0,
+            'l2_reg': 0.0,
+            'total_loss': base_loss.item()
+        }
+        
+        # 计算正则化项
+        if model is not None and (self.l1_lambda > 0 or self.l2_lambda > 0):
+            l1_reg = torch.tensor(0., device=next(model.parameters()).device)
+            l2_reg = torch.tensor(0., device=next(model.parameters()).device)
+            
+            for param in model.parameters():
+                if param.requires_grad:
+                    if self.l1_lambda > 0:
+                        l1_reg += torch.norm(param, p=1)
+                    if self.l2_lambda > 0:
+                        l2_reg += torch.norm(param, p=2)
+            
+            loss_components['l1_reg'] = (self.l1_lambda * l1_reg).item()
+            loss_components['l2_reg'] = (self.l2_lambda * l2_reg).item()
+            loss_components['total_loss'] = base_loss.item() + loss_components['l1_reg'] + loss_components['l2_reg']
+        return loss_components
+    
 # 改进：阈值优化函数
 def find_optimal_threshold(model, val_loader, device):
     """找到最优的分类阈值"""
@@ -444,10 +664,12 @@ def train_model(model, train_loader, val_loader, config, device, imbalance_ratio
     # 1. 自适应损失函数参数
     pos_weight = torch.tensor([min(imbalance_ratio, 10.0)]).to(device)  # 限制最大权重
     criterion = AdaptiveFocalLoss(
-        alpha=0.7,  # 稍微偏向少数类
-        gamma=1.5,  # 降低gamma避免过度聚焦
+        alpha=config['model']['alpha'],  # 稍微偏向少数类
+        gamma=config['model']['gamma'],  # 降低gamma避免过度聚焦
         pos_weight=pos_weight,
-        label_smoothing=0.05  # 轻微标签平滑
+        label_smoothing=config['model']['label_smoothing'],  # 轻微标签平滑
+        l1_lambda=config['model']['l1'],
+        l2_lambda=config['model']['l2']
     )
     
     # 2. 优化器 - 使用AdamW with weight decay
@@ -631,41 +853,6 @@ def plot_training_history(history):
     plt.tight_layout()
     plt.savefig('training_history.png')
     plt.show()
-
-# 使用加权损失函数处理不平衡数据
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, pos_weight=None, label_smoothing=0.0):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-        self.label_smoothing = label_smoothing
-    
-    def forward(self, inputs, targets):
-        # 标签平滑
-        if self.label_smoothing > 0:
-            targets = targets * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
-        
-        # 计算BCE损失
-        if self.pos_weight is not None:
-            bce_loss = nn.functional.binary_cross_entropy(
-                inputs, targets, reduction='none'
-            )
-            # 应用正样本权重
-            weights = torch.where(targets >= 0.5, self.pos_weight, 1.0)
-            bce_loss = bce_loss * weights
-        else:
-            bce_loss = nn.functional.binary_cross_entropy(inputs, targets, reduction='none')
-        
-        # Focal loss调制
-        p_t = torch.where(targets >= 0.5, inputs, 1 - inputs)
-        alpha_t = torch.where(targets >= 0.5, 
-                             self.alpha if self.alpha else 1.0, 
-                             1 - self.alpha if self.alpha else 1.0)
-        
-        focal_loss = alpha_t * (1 - p_t) ** self.gamma * bce_loss
-        
-        return focal_loss.mean()
     
 # 为WeightedRandomSampler创建样本权重
 def create_weighted_sampler(labels):
@@ -799,10 +986,12 @@ def main():
     # 创建临时的损失函数用于评估
     pos_weight = torch.tensor([min(imbalance_ratio, 10.0)]).to(device)
     eval_criterion = AdaptiveFocalLoss(
-        alpha=0.7,
-        gamma=1.5,
+        alpha=config['model']['alpha'],  # 稍微偏向少数类
+        gamma=config['model']['gamma'],  # 降低gamma避免过度聚焦
         pos_weight=pos_weight,
-        label_smoothing=0.05
+        label_smoothing=config['model']['label_smoothing'],  # 轻微标签平滑
+        l1_lambda=config['model']['l1'],
+        l2_lambda=config['model']['l2']
     )
     
     # 使用最优阈值评估

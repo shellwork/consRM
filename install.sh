@@ -1,1 +1,1 @@
-pip install imblearn
+pip install imblearn swanlab

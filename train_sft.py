@@ -371,11 +371,11 @@ def load_and_preprocess_data(data_path, genomic_feature_cols=None):
 def main():
     # 配置参数
     config = {
-        'data_path': 'data/c1.csv',  # 替换为你的数据文件路径
+        'data_path': 'data/c.csv',  # 替换为你的数据文件路径
         'model_path': './embed_model',  # 本地模型路径
         'genomic_feature_cols': None,
         'max_length': 512,
-        'batch_size': 32,
+        'batch_size': 64,
         'num_epochs': 5,
         'learning_rate': 2e-5,
         'weight_decay': 0.01,
@@ -383,11 +383,11 @@ def main():
         'dropout_rate': 0.1,
         'test_size': 0.2,
         'random_state': 42,
-        'save_path': 'best_dnabert2_model.pth',
+        'save_path': 'best_dnabert2_model_all.pth',
         'trust_remote_code': True,
         'local_files_only': True,
         # SwanLab 配置
-        'experiment_name': 'consRM_sft_mlp_1600',
+        'experiment_name': 'consRM_sft_mlp_all',
         'project_name': 'consRM',
         'description': 'Fine-tuning DNABERT2 for DNA conservation prediction with genomic features'
     }

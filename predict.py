@@ -172,7 +172,7 @@ class DNABERT2Predictor:
         self.scaler = scaler
         
         # 加载检查点
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         # 从检查点中获取模型配置信息
         model_state_dict = checkpoint['model_state_dict']
@@ -309,13 +309,13 @@ class DNABERT2Predictor:
         return metrics
 
 def main():
-    data_path = 'm6A_test_data.csv'  
+    data_path = 'data/eval/c1.csv'
     model_path = 'embed_model'
-    checkpoint_path = 'best_dnabert2_model.pth'
-    output_path = 'predictions.csv'
-    batch_size = 32
+    checkpoint_path = 'best_dnabert2_model_1_1.pth'
+    output_path = 'phast4way_m6A.csv'
+    batch_size = 64
     max_length = 512
-    has_labels = False  # 如果您的数据包含真实标签，请设置为 True
+    has_labels = True  # 如果您的数据包含真实标签，请设置为 True
     scaler_path = None 
 
     # 设置日志

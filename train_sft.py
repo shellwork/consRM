@@ -6,7 +6,7 @@ from transformers import AutoTokenizer, BertModel
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 import logging
 from tqdm import tqdm
@@ -252,6 +252,7 @@ class DNABERT2Trainer:
             all_labels, all_preds, average='binary'
         )
         auc = roc_auc_score(all_labels, all_probs)
+        auprc = average_precision_score(all_labels, all_probs) # <--- 新增: 计算AUPRC
         
         return {
             'loss': avg_loss,
@@ -259,7 +260,8 @@ class DNABERT2Trainer:
             'precision': precision,
             'recall': recall,
             'f1': f1,
-            'auc': auc
+            'auc': auc,
+            'auprc': auprc  # <--- 新增: 将AUPRC添加到返回结果中
         }
     
     def train(self, num_epochs, save_path=None):
@@ -293,6 +295,7 @@ class DNABERT2Trainer:
                 "val/recall": val_metrics['recall'],
                 "val/f1": val_metrics['f1'],
                 "val/auc": val_metrics['auc'],
+                "val/auprc": val_metrics['auprc'], # <--- 新增: 记录AUPRC
                 "learning_rate/bert": new_lr_bert,
                 "learning_rate/new_layers": new_lr_new,
                 "best_val_f1": max(best_val_f1, val_metrics['f1'])
@@ -303,10 +306,12 @@ class DNABERT2Trainer:
                 logger.info(f"Learning rate changed - BERT: {old_lr_bert:.2e} -> {new_lr_bert:.2e}, New layers: {old_lr_new:.2e} -> {new_lr_new:.2e}")
             
             logger.info(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+            # <--- 修改: 日志输出中增加AUPRC
             logger.info(f"Val Loss: {val_metrics['loss']:.4f}, "
-                       f"Val Acc: {val_metrics['accuracy']:.4f}, "
-                       f"Val F1: {val_metrics['f1']:.4f}, "
-                       f"Val AUC: {val_metrics['auc']:.4f}")
+                        f"Val Acc: {val_metrics['accuracy']:.4f}, "
+                        f"Val F1: {val_metrics['f1']:.4f}, "
+                        f"Val AUC: {val_metrics['auc']:.4f}, "
+                        f"Val AUPRC: {val_metrics['auprc']:.4f}")
             
             # 保存最佳模型
             if val_metrics['f1'] > best_val_f1:
@@ -333,32 +338,22 @@ class DNABERT2Trainer:
         # 记录最终的最佳指标
         swanlab.log({"final_best_f1": best_val_f1})
 
+
 def load_and_preprocess_data(data_path, genomic_feature_cols=None):
-    """加载和预处理数据"""
+    """加载数据"""
     df = pd.read_csv(data_path)
     
-    # 提取序列和标签
-    sequences = df.iloc[:, 0].values  # 第一列是序列
-    labels = df.iloc[:, -1].values  # 最后一列是标签
+    sequences = df.iloc[:, 0].values
+    labels = df.iloc[:, -1].values
     
-    # 提取组学特征
     if genomic_feature_cols is None:
-        # 自动检测：除了第一列（序列）和最后一列（标签）的所有列
         genomic_features = df.iloc[:, 1:-1].values
     else:
-        # 使用指定的列
         genomic_features = df.iloc[:, genomic_feature_cols].values
     
     genomic_feature_dim = genomic_features.shape[1]
     
-    # 标准化组学特征
-    if genomic_feature_dim > 0:
-        scaler = StandardScaler()
-        genomic_features = scaler.fit_transform(genomic_features)
-    else:
-        scaler = None
-    
-    # 输出数据统计信息到控制台
+    # 输出数据统计信息
     unique_labels, label_counts = np.unique(labels, return_counts=True)
     print(f"\n=== Dataset Statistics ===")
     print(f"Total samples: {len(sequences)}")
@@ -366,30 +361,31 @@ def load_and_preprocess_data(data_path, genomic_feature_cols=None):
     print(f"Label distribution: {dict(zip(unique_labels.tolist(), label_counts.tolist()))}")
     print(f"Class balance ratio: {label_counts.min() / label_counts.max():.3f}")
     
-    return sequences, genomic_features, labels, scaler, genomic_feature_dim
+    # 注意：不再进行StandardScaler处理，也不返回scaler
+    return sequences, genomic_features, labels, genomic_feature_dim
 
 def main():
     # 配置参数
     config = {
-        'data_path': 'data/c.csv',  # 替换为你的数据文件路径
+        'data_path': 'data/c1.csv',  # 替换为你的数据文件路径
         'model_path': './embed_model',  # 本地模型路径
         'genomic_feature_cols': None,
         'max_length': 512,
-        'batch_size': 64,
-        'num_epochs': 5,
-        'learning_rate': 2e-5,
+        'batch_size': 32,
+        'num_epochs': 15,
+        'learning_rate': 3e-5,
         'weight_decay': 0.01,
         'hidden_dim': 256,
         'dropout_rate': 0.1,
         'test_size': 0.2,
         'random_state': 42,
-        'save_path': 'best_dnabert2_model_all.pth',
+        'save_path': 'best_dnabert2_model_1_1.pth',
         'trust_remote_code': True,
         'local_files_only': True,
         # SwanLab 配置
-        'experiment_name': 'consRM_sft_mlp_all',
+        'experiment_name': 'del_phast4way_1:1',
         'project_name': 'consRM',
-        'description': 'Fine-tuning DNABERT2 for DNA conservation prediction with genomic features'
+        'description': 'formal training in 1:1 label'
     }
     
     # 初始化SwanLab
@@ -413,21 +409,38 @@ def main():
         print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     
     # 加载数据
-    logger.info("Loading and preprocessing data...")
-    sequences, genomic_features, labels, scaler, genomic_feature_dim = load_and_preprocess_data(
+    logger.info("Loading data...")
+    sequences, genomic_features, labels, genomic_feature_dim = load_and_preprocess_data(
         config['data_path'], 
         genomic_feature_cols=config.get('genomic_feature_cols', None)
     )
     
-    # 划分训练集和验证集
+    # 1. 先划分训练集和验证集
+    logger.info("Splitting data...")
     (train_seq, val_seq, 
-     train_genomic, val_genomic, 
+     train_genomic_raw, val_genomic_raw, # 使用raw后缀表示未处理
      train_labels, val_labels) = train_test_split(
         sequences, genomic_features, labels,
         test_size=config['test_size'],
         random_state=config['random_state'],
         stratify=labels
     )
+
+    # 2. 然后在划分后的数据上进行标准化
+    train_genomic = train_genomic_raw
+    val_genomic = val_genomic_raw
+    
+    if genomic_feature_dim > 0:
+        logger.info("Scaling genomic features...")
+        scaler = StandardScaler()
+        
+        # 使用训练集来拟合scaler
+        train_genomic = scaler.fit_transform(train_genomic_raw)
+        
+        # 使用同一个scaler来转换验证集
+        val_genomic = scaler.transform(val_genomic_raw)
+        
+        # test_genomic = scaler.transform(test_genomic_raw)
     
     # 输出数据划分信息到控制台
     print(f"\n=== Data Split ===")
@@ -444,7 +457,7 @@ def main():
         local_files_only=config['local_files_only']
     )
     
-    # 创建数据集
+    # 创建数据集时使用处理后的特征
     train_dataset = DNAConservationDataset(
         train_seq, train_genomic, train_labels, 
         tokenizer, config['max_length']
